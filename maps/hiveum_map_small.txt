@@ -1,0 +1,28 @@
+Kara north=Omrida south=Celles east=Chronoskis west=Larvonthi
+Ciiaescyg south=Dige east=Mari west=Phimesu
+Trapist north=Phimesu south=Turnep east=Dige west=Cheabrenta
+Cosma north=Cronvanbri east=Varlarbos west=Phantaxthos
+Larvonthi north=Andomi south=Benzarle east=Kara
+Mari south=Glatius west=Ciiaescyg
+Omrida north=Cheabrenta south=Kara east=Turnep west=Andomi
+Nelicos north=Lascogu south=Stagnibi east=Susveshpo west=Chronoskis
+Phantaxthos north=Celles east=Cosma west=Piterra
+Turnep north=Trapist south=Chronoskis east=Lascogu west=Omrida
+Glatius north=Mari south=Phantaxach west=Dige
+Cheabrenta north=Uraro south=Omrida east=Trapist west=Heli
+Lascogu north=Dige south=Nelicos east=Phantaxach west=Turnep
+Dovmars south=Heli east=Uraro
+Benzarle north=Larvonthi south=Piterra east=Celles
+Celles north=Kara south=Phantaxthos east=Cronvanbri west=Benzarle
+Piterra north=Benzarle east=Phantaxthos
+Phantaxach north=Glatius south=Susveshpo west=Lascogu
+Uraro south=Cheabrenta east=Phimesu west=Dovmars
+Varlarbos north=Stagnibi west=Cosma
+Heli north=Dovmars south=Andomi east=Cheabrenta
+Dige north=Ciiaescyg south=Lascogu east=Glatius west=Trapist
+Andomi north=Heli south=Larvonthi east=Omrida
+Phimesu south=Trapist east=Ciiaescyg west=Uraro
+Susveshpo north=Phantaxach west=Nelicos
+Chronoskis north=Turnep south=Cronvanbri east=Nelicos west=Kara
+Stagnibi north=Nelicos south=Varlarbos west=Cronvanbri
+Cronvanbri north=Chronoskis south=Cosma east=Stagnibi west=Celles

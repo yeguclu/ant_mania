@@ -1,0 +1,340 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::time::Instant;
+
+const NUM_DIRS: usize = 4; // N, S, E, W in this fixed order
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dir { North = 0, South = 1, East = 2, West = 3 }
+
+impl Dir {
+    #[inline]
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "north" => Some(Dir::North),
+            "south" => Some(Dir::South),
+            "east"  => Some(Dir::East),
+            "west"  => Some(Dir::West),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn opposite(self) -> Self {
+        match self {
+            Dir::North => Dir::South,
+            Dir::South => Dir::North,
+            Dir::East  => Dir::West,
+            Dir::West  => Dir::East,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Graph {
+    // id -> name
+    names: Vec<String>,
+    // adjacency: [N, S, E, W] holding Option<neighbor_id>
+    adj: Vec<[Option<u32>; NUM_DIRS]>,
+    // alive flag per colony (future steps will flip to false on destruction)
+    alive: Vec<bool>,
+}
+
+impl Graph {
+    fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let f = File::open(path)?;
+        let r = BufReader::new(f);
+
+        // First pass: assign ids to all names and collect raw neighbor strings per line.
+        let mut id_by_name: HashMap<String, u32> = HashMap::new();
+        let mut lines_raw: Vec<(u32, Vec<(Dir, String)>)> = Vec::new();
+
+        for line in r.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() { continue; }
+
+            let mut parts = line.split_whitespace();
+            let name = parts.next().ok_or_else(|| anyhow::anyhow!("malformed line: missing name"))?;
+
+            let id = if let Some(&existing_id) = id_by_name.get(name) {
+                existing_id
+            } else {
+                let new_id = id_by_name.len() as u32;
+                id_by_name.insert(name.to_string(), new_id);
+                new_id
+            };
+            let mut neighs: Vec<(Dir, String)> = Vec::with_capacity(4);
+
+            for tok in parts {
+                let mut kv = tok.split('=');
+                let k = kv.next().ok_or_else(|| anyhow::anyhow!("malformed token: {}", tok))?;
+                let v = kv.next().ok_or_else(|| anyhow::anyhow!("malformed token, missing '=': {}", tok))?;
+                if kv.next().is_some() { anyhow::bail!("extra '=' in token: {}", tok); }
+                let dir = Dir::from_str(k).ok_or_else(|| anyhow::anyhow!("unknown direction: {}", k))?;
+                neighs.push((dir, v.to_string()));
+            }
+
+            lines_raw.push((id, neighs));
+        }
+
+        // Allocate graph with known size.
+        let n = id_by_name.len();
+        let mut names = vec![String::new(); n];
+        for (name, &id) in &id_by_name {
+            names[id as usize] = name.clone();
+        }
+        let mut adj = vec![[None; NUM_DIRS]; n];
+        let alive = vec![true; n];
+
+        // Second pass: wire adjacency.
+        for (id, neighs) in lines_raw.into_iter() {
+            for (dir, vname) in neighs.into_iter() {
+                let &nid = id_by_name.get(&vname)
+                    .ok_or_else(|| anyhow::anyhow!("neighbor not defined in file: {}", vname))?;
+                adj[id as usize][dir as usize] = Some(nid);
+            }
+        }
+
+        Ok(Self { names, adj, alive })
+    }
+}
+
+// A tiny, fast per-ant RNG (xorshift64*)
+#[derive(Clone)]
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    #[inline] fn new(seed: u64) -> Self { Self { state: seed.max(1) } }
+    #[inline] fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    #[inline] fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
+    #[inline] fn gen_index(&mut self, m: u32) -> u32 { // returns in [0, m)
+        debug_assert!(m > 0);
+        // Fast modulo; m <= 4 here so bias is irrelevant.
+        self.next_u32() % m
+    }
+}
+
+struct AntSim {
+    g: Graph,
+    // ant i -> colony id
+    positions: Vec<u32>,
+    ant_available: Vec<bool>,
+    rngs: Vec<XorShift64>,
+
+    // per-iteration scratch
+    next_pos: Vec<u32>,
+    in_count: Vec<u32>,
+    fight_first: Vec<u32>,   // first incoming ant id per colony (u32::MAX = none)
+    fight_second: Vec<u32>,  // second incoming ant id per colony (u32::MAX = none)
+    touched_cols: Vec<u32>,    // which cols had in_count incremented this tick
+}
+
+impl AntSim {
+    fn new(g: Graph, n_ants: usize, seed: u64) -> Self {
+        let ncols = g.names.len();
+        assert!(ncols > 0, "empty map");
+        let mut rng = XorShift64::new(seed);
+        let mut positions = Vec::with_capacity(n_ants);
+        let mut rngs = Vec::with_capacity(n_ants);
+        for i in 0..n_ants {
+            // place randomly among alive colonies
+            let cid = rng.next_u32() as usize % ncols;
+            positions.push(cid as u32);
+            // seed per-ant rng differently (mix with i)
+            rngs.push(XorShift64::new(seed ^ ((i as u64).wrapping_mul(0x9E3779B97F4A7C15))));
+        }
+        let ant_available = vec![true; n_ants];
+
+        let invalid = u32::MAX;
+
+        Self {
+            g,
+            positions,
+            ant_available,
+            rngs,
+            next_pos: vec![0; n_ants],
+            in_count: vec![0; ncols],
+            fight_first: vec![invalid; ncols],
+            fight_second: vec![invalid; ncols],
+            touched_cols: Vec::with_capacity(n_ants.min(ncols)),
+        }
+    }
+
+    fn decide_moves(&mut self) {
+        // Sparse clear for touched colonies
+        let invalid = u32::MAX;
+        for &c in &self.touched_cols {
+            // reset only those we touched last tick
+            self.in_count[c as usize] = 0;
+            self.fight_first[c as usize] = invalid;
+            self.fight_second[c as usize] = invalid;
+        }
+        self.touched_cols.clear();
+    
+        let adj = &self.g.adj;
+        let alive_cols = &self.g.alive;
+        let n_ants = self.positions.len();
+    
+        for i in 0..n_ants {
+            if !self.ant_available[i] { continue; }
+            let cur = self.positions[i] as usize;
+            if !alive_cols[cur] {
+                self.next_pos[i] = cur as u32;
+                continue;
+            }
+    
+            // Collect available alive neighbors (max 4)
+            let mut buf: [u32; NUM_DIRS] = [0; NUM_DIRS];
+            let mut m: u32 = 0;
+            let row = &adj[cur];
+            if let Some(n) = row[0] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
+            if let Some(n) = row[1] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
+            if let Some(n) = row[2] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
+            if let Some(n) = row[3] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
+    
+            let dst = if m == 0 {
+                self.ant_available[i] = false;
+                cur as u32 // trapped: stay
+            } else {
+                let k = self.rngs[i].gen_index(m) as usize;
+                unsafe { *buf.get_unchecked(k) }
+            };
+    
+            self.next_pos[i] = dst;
+    
+            // Increment in_count[dst] and record first two ant IDs
+            let entry = &mut self.in_count[dst as usize];
+            match *entry {
+                0 => {
+                    self.touched_cols.push(dst);
+                    self.fight_first[dst as usize] = i as u32;
+                }
+                1 => {
+                    self.fight_second[dst as usize] = i as u32;
+                }
+                _ => { /* ignore beyond two; we only need a pair to print */ }
+            }
+            *entry += 1;
+        }
+    }
+
+    #[inline]
+    fn sever_colony(&mut self, col: u32) {
+        let c = col as usize;
+        self.g.alive[c] = false;
+        // For each dir, remove forward edge and reciprocal back-edge if present
+        for d in 0..NUM_DIRS {
+            if let Some(n) = self.g.adj[c][d] {
+                self.g.adj[c][d] = None;
+                // remove opposite on neighbor if it points back to `col`
+                let opp = match d {
+                    0 => 1, // N->S
+                    1 => 0, // S->N
+                    2 => 3, // E->W
+                    _ => 2, // W->E
+                };
+                let nu = n as usize;
+                if let Some(back) = self.g.adj[nu][opp] {
+                    if back == col { self.g.adj[nu][opp] = None; }
+                }
+            }
+        }
+    }
+
+    fn resolve_fights_and_destroy<W: std::fmt::Write>(&mut self, out: &mut W) {
+        let invalid = u32::MAX;
+        
+        // First pass: collect colonies to destroy and print messages
+        let mut to_destroy = Vec::new();
+        for &col in &self.touched_cols {
+            let c = col as usize;
+            if self.in_count[c] >= 2 {
+                // choose two fighter IDs deterministically
+                let a = self.fight_first[c];
+                let mut b = self.fight_second[c];
+                if b == invalid { b = a; } // extremely unlikely, but keep safe
+                let name = &self.g.names[c];
+
+                // print message
+                let _ = writeln!(out, "{name} has been destroyed by ant {a} and ant {b}!");
+                
+                to_destroy.push(col);
+            }
+        }
+        
+        // Second pass: actually destroy the colonies
+        for col in to_destroy {
+            self.sever_colony(col);
+        }
+    }
+
+    fn commit_moves(&mut self) {
+        for i in 0..self.positions.len() {
+            if !self.ant_available[i] { continue; }
+            let dst = self.next_pos[i] as usize;
+            if self.g.alive[dst] {
+                self.positions[i] = dst as u32;
+            } else {
+                // destination blown up this tick -> ant dies
+                self.ant_available[i] = false;
+            }
+        }
+    }
+
+    fn step<W: std::fmt::Write>(&mut self, out: &mut W) {
+        self.decide_moves();
+        self.resolve_fights_and_destroy(out);
+        self.commit_moves();
+    }
+
+    #[inline]
+    fn live_ants(&self) -> usize {
+        self.ant_available.iter().filter(|&&a| a).count()
+    }
+
+    /// Run until all ants dead or `max_iters` reached. Fight logs appended to `out`.
+    fn run(&mut self, max_iters: u32, out: &mut String) {
+        for _ in 0..max_iters {
+            if self.live_ants() == 0 { break; }
+            self.step(out);
+        }
+    }    
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() < 2 {
+        eprintln!("Usage: ant_mania <map_path> <num_ants> [seed]");
+        std::process::exit(2);
+    }
+    let n_ants: usize = args[1].parse()?;
+    let seed: u64 = if args.len() >= 3 { args[2].parse()? } else { 0xbadc0de_u64 };
+    
+    let map_path = &args[0];
+    let sim_t0 = Instant::now();
+    let g = Graph::new(map_path)?;
+    let mut sim = AntSim::new(g, n_ants, seed);
+
+    let mut fight_log = String::new();
+    sim.run(10_000, &mut fight_log);
+    let sim_elapsed = sim_t0.elapsed();
+
+    // Print all fight messages first
+    print!("{fight_log}");
+    eprintln!("Simulation time: {:?}", sim_elapsed);
+
+    Ok(())
+}
