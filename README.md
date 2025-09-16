@@ -2,10 +2,6 @@
 
 This project simulates wandering ants on a colony graph. Two ants entering the same colony in the same tick destroy each other and the colony. The map graph updates accordingly (edges removed), potentially trapping ants.
 
-### Goals and approach
-
-- **Simulation latency focus**: The implementation prioritizes time spent stepping the simulation. Map parsing is separated from the hot loop. The built-in benchmark mode reports average per-run latencies.
-- **Language**: Implemented in Rust for performance and safety.
 - **Assumptions**:
   - Input map follows the described format: one colony per line, followed by up to 4 directional edges (`north|south|east|west=name`).
   - Colony names are unique and contain no `=` or whitespace.
