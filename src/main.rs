@@ -33,14 +33,15 @@ impl Dir {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Graph {
     // id -> name
     names: Vec<String>,
-    // adjacency: [N, S, E, W] holding Option<neighbor_id>
-    adj: Vec<[Option<u32>; NUM_DIRS]>,
     // alive flag per colony (future steps will flip to false on destruction)
     alive: Vec<bool>,
+    // compact neighbors: only live edges, kept in sync on sever
+    neighbors: Vec<[u32; NUM_DIRS]>,
+    neighbor_len: Vec<u8>,
 }
 
 impl Graph {
@@ -99,7 +100,19 @@ impl Graph {
             }
         }
 
-        Ok(Self { names, adj, alive })
+        // Build compact neighbor arrays from adj
+        let mut neighbors = vec![[0u32; NUM_DIRS]; n];
+        let mut neighbor_len = vec![0u8; n];
+        for (i, row) in adj.iter().enumerate() {
+            let mut k: usize = 0;
+            if let Some(n0) = row[0] { neighbors[i][k] = n0; k += 1; }
+            if let Some(n1) = row[1] { neighbors[i][k] = n1; k += 1; }
+            if let Some(n2) = row[2] { neighbors[i][k] = n2; k += 1; }
+            if let Some(n3) = row[3] { neighbors[i][k] = n3; k += 1; }
+            neighbor_len[i] = k as u8;
+        }
+
+        Ok(Self { names, alive, neighbors, neighbor_len })
     }
 }
 
@@ -110,8 +123,8 @@ struct XorShift64 {
 }
 
 impl XorShift64 {
-    #[inline] fn new(seed: u64) -> Self { Self { state: seed.max(1) } }
-    #[inline] fn next_u64(&mut self) -> u64 {
+    #[inline(always)] fn new(seed: u64) -> Self { Self { state: seed.max(1) } }
+    #[inline(always)] fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -119,8 +132,8 @@ impl XorShift64 {
         self.state = x;
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    #[inline] fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
-    #[inline] fn gen_index(&mut self, m: u32) -> u32 { // returns in [0, m)
+    #[inline(always)] fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
+    #[inline(always)] fn gen_index(&mut self, m: u32) -> u32 { // returns in [0, m)
         debug_assert!(m > 0);
         // Fast modulo; m <= 4 here so bias is irrelevant.
         self.next_u32() % m
@@ -131,7 +144,8 @@ struct AntSim {
     g: Graph,
     // ant i -> colony id
     positions: Vec<u32>,
-    ant_available: Vec<bool>,
+    live_ant_ids: Vec<usize>,
+    ant_index_in_live: Vec<usize>,
     rngs: Vec<XorShift64>,
 
     // per-iteration scratch
@@ -156,14 +170,16 @@ impl AntSim {
             // seed per-ant rng differently (mix with i)
             rngs.push(XorShift64::new(seed ^ ((i as u64).wrapping_mul(0x9E3779B97F4A7C15))));
         }
-        let ant_available = vec![true; n_ants];
+        let live_ant_ids = (0..n_ants).collect::<Vec<_>>();
+        let ant_index_in_live = (0..n_ants).collect::<Vec<_>>();
 
         let invalid = u32::MAX;
 
         Self {
             g,
             positions,
-            ant_available,
+            live_ant_ids,
+            ant_index_in_live,
             rngs,
             next_pos: vec![0; n_ants],
             in_count: vec![0; ncols],
@@ -173,6 +189,19 @@ impl AntSim {
         }
     }
 
+    #[inline]
+    fn remove_live_ant(&mut self, ant_id: usize) {
+        let idx = self.ant_index_in_live[ant_id];
+        if idx == usize::MAX { return; }
+        let last = self.live_ant_ids.pop().unwrap();
+        if last != ant_id {
+            self.live_ant_ids[idx] = last;
+            self.ant_index_in_live[last] = idx;
+        }
+        self.ant_index_in_live[ant_id] = usize::MAX;
+    }
+
+    #[inline(always)]
     fn decide_moves(&mut self) {
         // Sparse clear for touched colonies
         let invalid = u32::MAX;
@@ -184,33 +213,26 @@ impl AntSim {
         }
         self.touched_cols.clear();
     
-        let adj = &self.g.adj;
-        let alive_cols = &self.g.alive;
-        let n_ants = self.positions.len();
-    
-        for i in 0..n_ants {
-            if !self.ant_available[i] { continue; }
+        let mut idx = 0usize;
+        while idx < self.live_ant_ids.len() {
+            let i = self.live_ant_ids[idx];
             let cur = self.positions[i] as usize;
-            if !alive_cols[cur] {
+            if !self.g.alive[cur] {
                 self.next_pos[i] = cur as u32;
+                idx += 1;
                 continue;
             }
     
-            // Collect available alive neighbors (max 4)
-            let mut buf: [u32; NUM_DIRS] = [0; NUM_DIRS];
-            let mut m: u32 = 0;
-            let row = &adj[cur];
-            if let Some(n) = row[0] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
-            if let Some(n) = row[1] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
-            if let Some(n) = row[2] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
-            if let Some(n) = row[3] { if alive_cols[n as usize] { buf[m as usize] = n; m += 1; } }
-    
-            let dst = if m == 0 {
-                self.ant_available[i] = false;
-                cur as u32 // trapped: stay
+            // Use compact neighbor list
+            let len = self.g.neighbor_len[cur] as usize;
+            let dst = if len == 0 {
+                // trapped: ant dies immediately
+                self.remove_live_ant(i);
+                // do not advance idx since we swapped another ant into this idx
+                continue;
             } else {
-                let k = self.rngs[i].gen_index(m) as usize;
-                unsafe { *buf.get_unchecked(k) }
+                let k = self.rngs[i].gen_index(len as u32) as usize;
+                unsafe { *self.g.neighbors.get_unchecked(cur).get_unchecked(k) }
             };
     
             self.next_pos[i] = dst;
@@ -228,30 +250,33 @@ impl AntSim {
                 _ => { /* ignore beyond two; we only need a pair to print */ }
             }
             *entry += 1;
+
+            idx += 1;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn sever_colony(&mut self, col: u32) {
         let c = col as usize;
         self.g.alive[c] = false;
-        // For each dir, remove forward edge and reciprocal back-edge if present
-        for d in 0..NUM_DIRS {
-            if let Some(n) = self.g.adj[c][d] {
-                self.g.adj[c][d] = None;
-                // remove opposite on neighbor if it points back to `col`
-                let opp = match d {
-                    0 => 1, // N->S
-                    1 => 0, // S->N
-                    2 => 3, // E->W
-                    _ => 2, // W->E
-                };
-                let nu = n as usize;
-                if let Some(back) = self.g.adj[nu][opp] {
-                    if back == col { self.g.adj[nu][opp] = None; }
+        // Remove all neighbors of c in compact list and back-edges
+        let len_c = self.g.neighbor_len[c] as usize;
+        for k in 0..len_c {
+            let n = self.g.neighbors[c][k] as usize;
+            // remove back-edge in neighbor compact list
+            let len_n = self.g.neighbor_len[n] as usize;
+            for t in 0..len_n {
+                if self.g.neighbors[n][t] as usize == c {
+                    // swap_remove within fixed array region [0..len)
+                    let last_idx = len_n - 1;
+                    self.g.neighbors[n][t] = self.g.neighbors[n][last_idx];
+                    self.g.neighbor_len[n] = (last_idx) as u8;
+                    break;
                 }
             }
         }
+        // clear c's own list
+        self.g.neighbor_len[c] = 0;
     }
 
     fn resolve_fights_and_destroy<W: std::fmt::Write>(&mut self, out: &mut W) {
@@ -281,15 +306,19 @@ impl AntSim {
         }
     }
 
+    #[inline(always)]
     fn commit_moves(&mut self) {
-        for i in 0..self.positions.len() {
-            if !self.ant_available[i] { continue; }
+        let mut idx = 0usize;
+        while idx < self.live_ant_ids.len() {
+            let i = self.live_ant_ids[idx];
             let dst = self.next_pos[i] as usize;
             if self.g.alive[dst] {
                 self.positions[i] = dst as u32;
+                idx += 1;
             } else {
                 // destination blown up this tick -> ant dies
-                self.ant_available[i] = false;
+                self.remove_live_ant(i);
+                // do not advance idx; swapped ant now at this index
             }
         }
     }
@@ -301,9 +330,7 @@ impl AntSim {
     }
 
     #[inline]
-    fn live_ants(&self) -> usize {
-        self.ant_available.iter().filter(|&&a| a).count()
-    }
+    fn live_ants(&self) -> usize { self.live_ant_ids.len() }
 
     /// Run until all ants dead or `max_iters` reached. Fight logs appended to `out`.
     fn run(&mut self, max_iters: u32, out: &mut String) {
@@ -316,6 +343,39 @@ impl AntSim {
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        eprintln!("Usage:\n  ant_mania <map_path> <num_ants> [seed]\n  ant_mania bench <map_path> [trials] [seed] <count1> <count2> ...");
+        std::process::exit(2);
+    }
+
+    if args[0] == "bench" {
+        // Usage: bench <map_path> <num_ants> <trials> [seed]
+        if args.len() < 4 {
+            eprintln!("Usage: ant_mania bench <map_path> <num_ants> <trials> [seed]");
+            std::process::exit(2);
+        }
+        let map_path = &args[1];
+        let n_ants: usize = args[2].parse()?;
+        let trials: u32 = args[3].parse()?;
+        let seed: u64 = if args.len() >= 5 { args[4].parse()? } else { 0xbadc0de_u64 };
+
+        println!("bench map={} ants={} trials={} seed={}", map_path, n_ants, trials, seed);
+        let mut total_ns: u128 = 0;
+        for t in 0..trials {
+            let t0 = Instant::now();
+            let g = Graph::new(map_path)?;
+            let mut sim = AntSim::new(g, n_ants, seed ^ (t as u64));
+            let mut fight_log = String::new();
+            sim.run(10_000, &mut fight_log);
+            let dt = t0.elapsed();
+            total_ns += dt.as_nanos();
+        }
+        let avg_ns = total_ns / (trials as u128);
+        let avg_dur = std::time::Duration::from_nanos(avg_ns as u64);
+        eprintln!("Average time: {:?}", avg_dur);
+        return Ok(());
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: ant_mania <map_path> <num_ants> [seed]");
         std::process::exit(2);
@@ -324,6 +384,8 @@ fn main() -> anyhow::Result<()> {
     let seed: u64 = if args.len() >= 3 { args[2].parse()? } else { 0xbadc0de_u64 };
     
     let map_path = &args[0];
+    
+    // timer starts before graph construction
     let sim_t0 = Instant::now();
     let g = Graph::new(map_path)?;
     let mut sim = AntSim::new(g, n_ants, seed);
@@ -334,7 +396,14 @@ fn main() -> anyhow::Result<()> {
 
     // Print all fight messages first
     print!("{fight_log}");
+    // Summary stats
+    let total_cols = sim.g.names.len();
+    let alive_cols = sim.g.alive.iter().filter(|&&a| a).count();
+    let destroyed_cols = total_cols - alive_cols;
+    let ants_remaining = sim.live_ants();
     eprintln!("Simulation time: {:?}", sim_elapsed);
+    eprintln!("Destroyed colonies: {}", destroyed_cols);
+    eprintln!("Ants remaining: {}", ants_remaining);
 
     Ok(())
 }
