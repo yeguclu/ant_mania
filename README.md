@@ -14,7 +14,6 @@ This project simulates wandering ants on a colony graph. Two ants entering the s
 - **Compact neighbor list per colony**: Store neighbors as a fixed-size array `[u32; 4]` plus `neighbor_len`. On destruction, back-edges are removed via swap-with-last in O(degree). Ant move choice is then `rng % neighbor_len` with direct indexing—no per-tick filtering.
 - **Sparse clearing**: Track only colonies touched in a tick and reset per-tick scratch (`in_count`, fighter pairs) for those colonies, avoiding full-vector clears.
 - **Tight hot loop**: Inlined hot functions and RNG; minimized bounds checks where safe.
-- **Removed redundant structures**: Dropped `ant_available`, `live_count`, and the original adjacency once compact neighbors are built.
 
 ### Usage
 
